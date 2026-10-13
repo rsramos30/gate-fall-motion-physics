@@ -2,6 +2,13 @@
 
 Data: 2026-10-13. Base preservada: `301b32e42e47f29fed1daf607948d11ddf3b4e5d`.
 
+Implementação publicada no commit `9fb8a8a`, nas branches `main` e
+`codex/motion-physics-learning` de
+[rsramos30/gate-fall-motion-physics](https://github.com/rsramos30/gate-fall-motion-physics).
+É um repositório derivado independente, preservando o histórico; a tentativa
+de segundo fork nativo retornou o fork já existente na conta. O checkout e
+o repositório anteriores não receberam alterações nesta implementação.
+
 ## Resultados de engenharia
 
 | Checagem | Resultado |

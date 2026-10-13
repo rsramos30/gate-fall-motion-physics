@@ -14,5 +14,5 @@
 ## Verificação e publicação
 - [x] T009 Validar contratos em src/gatefall/experiments/motion/selftest.py.
 - [x] T010 Registrar checagens em specs/002-motion-physics-learning/validation.md.
-- [ ] T011 Publicar derivação e procedência em README.md.
+- [x] T011 Publicar derivação e procedência em README.md.
 Dependências: T003/T004 antes de T005; T005 antes de T006/T007; estes antes de T009. Dados reais ficam para o aluno.
