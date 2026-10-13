@@ -1,6 +1,7 @@
 """Treino e avaliação do experimento, sem modificar os runs de referência."""
 
 import json
+import hashlib
 import math
 import os
 import tempfile
@@ -11,7 +12,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from gatefall.config import NUM_CLASSES, TRAIN_STRIDE
+from gatefall.config import NUM_CLASSES, TARGET_FPS, TRAIN_STRIDE
 from gatefall.data.windowing import window_frame_indices
 from gatefall.eval.shared.alarm_protocol import BASELINE_A_ALARM_PROTOCOL
 from gatefall.eval.shared.events import split_event_report
@@ -78,7 +79,9 @@ def standardize(values: np.ndarray, stats: dict, name: str, evidence: np.ndarray
 
 class Windows(Dataset):
     def __init__(self, manifest: dict, videos: dict[str, dict[str, np.ndarray]], stats: dict,
-                 split: str, stride: int, labeled_only: bool = True) -> None:
+                 split: str, stride: int, labeled_only: bool = True,
+                 motion_targets: dict | None = None) -> None:
+        self.motion_targets = motion_targets
         self.index: list[tuple[str, int]] = []
         self.videos: dict[str, dict[str, np.ndarray]] = {}
         for entry in manifest["videos"]:
@@ -108,6 +111,9 @@ class Windows(Dataset):
         indices = window_frame_indices(end, len(data["labels"]))
         result = {name: torch.from_numpy(value[indices].copy()) for name, value in data.items() if name != "labels"}
         result["label"] = torch.tensor(int(data["labels"][end]), dtype=torch.long)
+        if self.motion_targets is not None:
+            for name, value in self.motion_targets[identity].items():
+                result["motion_" + name] = torch.from_numpy(value[end].copy())
         return result
 
 
@@ -158,20 +164,49 @@ def train(
     bundle: Path, run_dir: Path, *, arm: str, fusion: str, seed: int = 42,
     epochs: int = 30, batch_size: int = 64, checkpoint_policy: str = "best_val",
     augment: bool = False, order_weight: float = 0, order_margin: float = .05,
+    motion_recipe: str | None = None, targets: Path | None = None,
+    motion_weight: float = .1, physics_weight: float = .1,
 ) -> dict:
     bundle = bundle.resolve(); run_dir = run_dir.resolve()
     validate_local_run_dir(run_dir)
     if run_dir.exists() or bundle in run_dir.parents:
         raise ValueError("run deve ser novo e externo ao pacote de entrada")
     manifest, videos = load_bundle(bundle)
+    motion_config = None
+    motion_targets = None
+    if motion_recipe is not None:
+        from gatefall.experiments.motion import RECIPES, SCHEMA, SPATIAL_SCALE
+        from gatefall.experiments.motion.data import load_targets
+        if (motion_recipe not in RECIPES or targets is None
+                or any(not math.isfinite(w) or w <= 0 for w in (motion_weight, physics_weight))):
+            raise ValueError("receita motion exige targets e pesos finitos positivos")
+        meta, motion_targets, coverage = load_targets(targets, bundle, manifest, videos)
+        motion_config = {
+            "schema": SCHEMA, "recipe": motion_recipe, "horizons": meta["horizons"],
+            "motion_weight": motion_weight, "physics_weight": physics_weight,
+            "spatial_scale": SPATIAL_SCALE, "coverage": coverage,
+            "targets_sha256": sha256_file(targets / "motion-manifest.json"),
+            "supervision_on": "clean_train_only",
+        }
+    elif targets is not None:
+        raise ValueError("targets exige motion_recipe")
     validate_local_run_dir(run_dir, manifest["dataset"])
     validate_recipe(arm, fusion, manifest["visual_kind"], epochs, batch_size,
                     checkpoint_policy, augment, order_weight, order_margin)
     stats = fit_stats(manifest, videos)
-    train_data = Windows(manifest, videos, stats, "train", TRAIN_STRIDE)
+    train_data = Windows(manifest, videos, stats, "train", TRAIN_STRIDE, motion_targets=motion_targets)
     val_data = Windows(manifest, videos, stats, "val", 1)
     device = configure_determinism(seed)
-    model = FusionClassifier(manifest["visual_dim"], fusion).to(device)
+    if motion_config is None:
+        model = FusionClassifier(manifest["visual_dim"], fusion).to(device)
+    else:
+        from gatefall.experiments.motion.learning import MotionClassifier
+        model = MotionClassifier(manifest["visual_dim"], fusion, motion_config["horizons"]).to(device)
+        digest = hashlib.sha256()
+        for name, value in model.state_dict().items():
+            digest.update(name.encode())
+            digest.update(value.detach().cpu().numpy().tobytes())
+        motion_config["initial_state_sha256"] = digest.hexdigest()
     weights = np.zeros(NUM_CLASSES, dtype=np.float32)
     counts = np.bincount([int(train_data.videos[v]["labels"][k]) for v, k in train_data.index], minlength=NUM_CLASSES)
     weights[counts > 0] = 1 / counts[counts > 0]
@@ -192,6 +227,8 @@ def train(
         "code_provenance": code_provenance(),
         "trainable_param_count": sum(p.numel() for p in model.parameters() if p.requires_grad),
     }
+    if motion_config is not None:
+        config["motion"] = motion_config
     run_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".physics-train-", dir=run_dir.parent) as temporary:
         stage = Path(temporary) / "run"; stage.mkdir()
@@ -199,10 +236,20 @@ def train(
         history = []; best = -math.inf; selected_epoch = 0
         for epoch in range(1, epochs + 1):
             model.train(); total_loss = total_order = 0.0; seen = 0
+            total_classification = total_motion = total_physics = 0.0
             for batch_cpu in loader:
                 b = {name: value.to(device) for name, value in batch_cpu.items()}
                 optimizer.zero_grad()
-                clean_logits = model(b["pose"], b["visual"], b["evidence"])
+                if motion_config is not None and motion_recipe != "baseline":
+                    from gatefall.experiments.motion.learning import MotionClassifier, motion_losses
+                    assert isinstance(model, MotionClassifier)
+                    clean_logits, position, velocity = model.forward_with_motion(b["pose"], b["visual"], b["evidence"])
+                    supervised, consistency = motion_losses(
+                        position, velocity, b,
+                        torch.tensor(motion_config["horizons"], device=device) / TARGET_FPS)
+                else:
+                    clean_logits = model(b["pose"], b["visual"], b["evidence"])
+                    supervised = consistency = clean_logits.sum() * 0
                 loss = criterion(clean_logits, b["label"])
                 order = clean_logits.sum() * 0
                 if augment:
@@ -220,12 +267,20 @@ def train(
                             b["pose_changed"] & (b["evidence"][..., 7] > 0),
                             b["visual_changed"] & (b["evidence"][..., 6] > 0), order_margin,
                         )
-                        loss = loss + order_weight * order
+                classification_loss = loss
+                loss = loss + order_weight * order
+                if motion_recipe in ("motion", "motion_physics"):
+                    loss = loss + motion_weight * supervised
+                if motion_recipe == "motion_physics":
+                    loss = loss + physics_weight * consistency
                 if not torch.isfinite(loss):
                     raise RuntimeError("perda não finita")
                 loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
                 count = len(b["label"]); seen += count
                 total_loss += loss.item() * count; total_order += order.item() * count
+                total_classification += classification_loss.item() * count
+                total_motion += supervised.item() * count
+                total_physics += consistency.item() * count
             scheduler.step()
             true, pred = predict(model, val_data, device, batch_size)
             score = restricted_macro_f1(true, pred)[0]
@@ -234,6 +289,9 @@ def train(
                 torch.save(model.state_dict(), stage / "checkpoint.pt")
             history.append({"epoch": epoch, "train_loss": total_loss / seen,
                             "order_loss": total_order / seen, "val_macro_f1_restricted": score})
+            if motion_config is not None:
+                history[-1].update(classification_loss=total_classification / seen,
+                                   motion_loss=total_motion / seen, consistency_loss=total_physics / seen)
             print(f"{arm}/{fusion} epoch {epoch}/{epochs}: val_macro_f1={score:.4f}")
         torch.save(model.state_dict(), stage / "last.pt")
         model.load_state_dict(torch.load(stage / "checkpoint.pt", map_location=device, weights_only=True))
@@ -276,7 +334,11 @@ def evaluate(bundle: Path, run_dir: Path, split: str = "test") -> dict:
     if stats != fit_stats(manifest, videos):
         raise ValueError("estatísticas não correspondem exclusivamente ao treino deste pacote")
     device = "cpu"
-    model = FusionClassifier(manifest["visual_dim"], config["fusion"])
+    if "motion" in config:
+        from gatefall.experiments.motion.learning import MotionClassifier
+        model = MotionClassifier(manifest["visual_dim"], config["fusion"], config["motion"]["horizons"])
+    else:
+        model = FusionClassifier(manifest["visual_dim"], config["fusion"])
     model.load_state_dict(torch.load(run_dir / "checkpoint.pt", map_location=device, weights_only=True))
     data = Windows(manifest, videos, stats, split, 1, labeled_only=False)
     true, pred = predict(model, data, device, config["batch_size"])

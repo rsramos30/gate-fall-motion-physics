@@ -61,7 +61,7 @@ class FusionClassifier(nn.Module):
         self.encoder = TCNEncoder(input_dim, [32, 32, 32], 3, [1, 2, 4], .3)
         self.classifier = nn.Linear(32, NUM_CLASSES)
 
-    def forward(self, pose: torch.Tensor, visual: torch.Tensor, evidence: torch.Tensor) -> torch.Tensor:
+    def encode(self, pose: torch.Tensor, visual: torch.Tensor, evidence: torch.Tensor) -> torch.Tensor:
         if (pose.ndim != 3 or pose.shape[1:] != (WINDOW_FRAMES, POSE_DIM)
                 or visual.shape != (*pose.shape[:2], self.visual_dim)
                 or evidence.shape != (*pose.shape[:2], 8)):
@@ -79,7 +79,10 @@ class FusionClassifier(nn.Module):
             if self.fusion == "quality_concat":
                 fused = torch.cat((fused, evidence), dim=-1)
         encoded = self.encoder(fused.transpose(1, 2))
-        return self.classifier(encoded[:, :, -1])
+        return encoded[:, :, -1]
+
+    def forward(self, pose: torch.Tensor, visual: torch.Tensor, evidence: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.encode(pose, visual, evidence))
 
 
 def ordering_loss(

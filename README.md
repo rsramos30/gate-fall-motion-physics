@@ -1,5 +1,17 @@
 # GateFall
 
+> **Experimento de aprendizado de movimento (2026-10-13).** Este repositório
+> deriva de [rsramos30/gate-fall-engine](https://github.com/rsramos30/gate-fall-engine),
+> revisão `301b32e`, mantendo o histórico do projeto original de
+> [Arthur Ghizi](https://github.com/Arthu085/gate-fall-engine).
+> É uma derivação independente: o GitHub reutilizou o fork já existente da conta.
+> Implementa três receitas pareadas: baseline, previsão de movimento e previsão
+> com coerência cinemática. **Melhoria em dados reais ainda não foi demonstrada.**
+>
+> Começar pelo [guia do aluno](docs/experiments/motion-physics.md).
+> [Especificação Spec Kit](specs/002-motion-physics-learning/spec.md) e
+> [plano](specs/002-motion-physics-learning/plan.md).
+
 **Fusão Adaptativa por Confiança entre Pose e Informação Visual de Modelos de Fundação para Detecção Robusta de Quedas Humanas**
 
 Trabalho de Conclusão de Curso em Visão Computacional de **Arthur Ghizi**, orientado por **Rodrigo Ramos Silva**.
